@@ -1,0 +1,326 @@
+---
+title: "Creating data-linked interactive heatmaps using ggiraph and knitr"
+author: "Andrew Wallace"
+date: "August 14, 2019"
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE, message = FALSE, warning = FALSE)
+library(ggiraph)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(viridis)
+library(kableExtra)
+library(ggdendro)
+```
+
+Heatmaps are a fantastic tool for exploratory data analysis, and the R ecosystem has pretty impressive support for making heatmaps of all kinds.  Packages that facilitate the use of annotation rows/columns (e.g. `pheatmap`) have dramatically facilitiated the visual identification of broad patterns in data . Packages that enable zooming + mouseover interactivity (e.g `heatmaply`, `iheatmapr`) have created the ability to easily pull out individual examples of particular patterns for further analysis. 
+
+Of particular interest to me, though, is the ability to click on specific observations in a heatmap and bring up additional information about those observations.  The color of a heatmap cell after all is representing just a single value - the ability to click on the cell and bring up additional context could be exceedingly useful.  
+
+Below, I show one example of this, where clicking on a row opens up a link to a page containing contextual information about the entity the row represents:
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=TRUE}
+
+ggobj = knitr::load_cache('ggiraph-block', 'x')
+
+x
+
+```
+
+The specific content of this heatmap is not important, but if you're interested it illustrates alternative splicing event inclusion levels in a timecourse experiment, and clicking on the rows opens a link to the UCSC Genome Browser at the location of the event.
+
+I made this particular heatmap with the package `ggiraph` (https://davidgohel.github.io/ggiraph/index.html), which brings interactivity to ggplot2.  The most important bit of code for the heatmap is below (this is missing the dendrogram and the theme manipulations for clarity - the full code is shown below in section **Plot heatmap**):
+
+```{r eval=FALSE}
+
+hu_sig_psi_heatmap <- 
+  hu_sig_psi_long %>% 
+  ggplot(aes(x = time, y = event_id)) + 
+    geom_tile_interactive(
+      aes(fill = PSI, 
+          tooltip = event_id, 
+          onclick = onclick), 
+          size = 3)
+
+girafe_obj = girafe(
+  ggobj = hu_sig_psi_heatmap)
+
+girafe_obj <- girafe_options(girafe_obj, opts_zoom(max = 5))
+
+girafe_obj
+
+```
+
+`ggiraph` provides many `ggplot2` geoms appended with '_interactive', such as the `geom_tile_interactive` used here, which provide the additional aesthetics `tooltip`, to which the column containing desired mouseover text should be assigned, and `onclick`, to which the column containing desired click behavior should be assigned.  In my case, the latter contains a `window.open()` call, which contains a programmatically generated URL that is specific to the entity plotted in each row.  Here's what the final `hu_sig_psi_long` dataframe that goes into the command looks like:
+
+```{r echo = FALSE}
+
+y = knitr::load_cache('finalized-df', 'hu_sig_psi_long')
+
+head(y) %>% 
+  kable("html") %>% 
+  kable_styling() %>% 
+  scroll_box(width = "800px", height = "200px")
+
+```
+
+While `ggiraph` supports on-click events in `shiny` apps as well (see example by me here: https://anjowall.shinyapps.io/openoasis_digital_divide/), the use of `shiny` is not at all necessary, and in this case the interactive heatmap is generated only by knitting an Rmarkdown file to html in Rstudio.  To me this is a major advantage, as it's very easy to host or directly share a simple html file and there is no need to deploy an app or for co-workers to know anything about using Rstudio in order to leverage the product.  
+
+Despite its advantages, the approach here has a number of drawbacks:
+
+1) When heatmaps get large the page load time can get a bit extreme.
+
+2) Annotation rows/columns can be a little inconvenient to work with in ggplot, but this can be addressed using grid/gridExtra.
+
+3) Clustering and the associated dendrogram need to be done separately.  The dendrogram in particular can be finicky, but is not strictly necessary to have.
+
+Read the rest of the post to walk through the whole process!
+
+## Preliminaries
+
+### Necessary libraries
+
+To start, I load the necessary libraries.  The essential libraries for this tutorial are `ggiraph`, `ggplot2`, and `knitr`. As mentioned above, `ggiraph` sits on top of `ggplot2`, adding interactive layers with largely the same syntax. `knitr` is used to "knit" the Rmarkdown document to an html file in Rstudio. `ggdendro` is used to optionally create a dendrogram - unlike many dedicated heatmap packages `ggplot2` (and therefore `ggiraph`) will not autmatically generate one.  
+
+```{r, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE, message = FALSE, warning = FALSE)
+library(ggiraph)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(viridis)
+library(kableExtra)
+library(ggdendro)
+```
+
+### Importing data
+
+First I import the data, which is in wide format and contains the values I want to plot as a heatmap, a unique identifier for each row of values (in this case the ID of an alternative splicing event), and some additional information that will later be used to create the links for each row.
+
+```{r}
+
+hu_sig_psi <- read.table(
+  paste0("~/all_psi_tutorial.tsv"), 
+  sep = "\t", 
+  header = TRUE, 
+  stringsAsFactors = FALSE, 
+  quote = "")
+
+head(hu_sig_psi) %>% 
+  kable("html") %>% 
+  kable_styling() %>% 
+  scroll_box(width = "800px", height = "200px")
+```
+
+
+## Clustering data
+
+Unlike many other libraries that generate heatmaps (e.g. `pheatmap`, a personal favorite of mine), ggplot2 has no built-in method (that I'm aware of) to cluster data prior to plotting.  Fortunately, it's pretty straightforward to do our own clustering prior to plotting.
+
+I start by selecting only the values to be clustered from the dataframe and converting them into a matrix.
+```{r}
+hu_sig_psi_mat <- 
+  hu_sig_psi[, 2:18] %>% 
+  as.matrix()
+```
+
+I then calculate the euclidean row distance matrix and perform hierarchical clustering.
+
+```{r}
+hc <- hclust(dist(hu_sig_psi_mat, method = "euclidean"), 
+             method = "ward.D")
+```
+
+After which I use the order of the hclust result to rearrange the original data frame.
+
+```{r}
+hu_sig_psi <- hu_sig_psi[hc$order, ]
+```
+
+Note that in my case I'm plotting timeseries data and thus want the columns to be ordered from earliest to latest timepoint - I am not interested in column clustering in this case.  However, it should be perfectly possible to extend this to cluster columns as well.
+
+### Generating dendrogram (optional)
+
+I generate a dendrogram, generate plotting data using `ggdendro`, after which I extract the coordinates as a dataframe.
+
+```{r}
+
+dhr <- as.dendrogram(hc)
+data_r <- ggdendro::dendro_data(dhr, type = "rectangle")
+data_r <- segment(data_r)
+
+```
+
+I then flip the x- and y-coordinates of the dendrogram so that it can be displayed alongside the heatmap, rescale the width, and shift the coordinates over by the number of columns in the heatmap.  This bit is the most finicky and likely would at least some minor adjustment for each particular application.
+
+The most important bit is the `+ length(colnames(hu_sig_psi_mat))` for both `x_` and `x_end`.  This offsets the dendrogram appropriately from the heatmap so they are not plotted on top of one another (with the `+ 0.1` added for a bit of extra whitespace).  I believe I got this from one of the examples on the `ggiraph` wiki (see 'Dynamic dendrogram' section on https://davidgohel.github.io/ggiraph/articles/offcran/examples.html)
+
+```{r}
+
+data_r <- 
+  data_r %>% 
+  dplyr::mutate(
+    y = y/y^0.75, 
+    yend = yend/yend^0.75) %>% 
+  dplyr::mutate(
+    x_ = y + length(colnames(hu_sig_psi_mat)) + 0.1, 
+    xend_ = yend + length(colnames(hu_sig_psi_mat)) + 0.1, 
+    y_ = x, 
+    yend_ = xend)
+
+```
+
+## Wrangling data
+
+### Separating string columns in preparation for creating the urls.
+
+This bit is going to be highly specific to whatever you're using to create the column/row/observation-specific links.  In my case I need to separate the `position` column into component parts that will make it easier to create the URL later.
+
+```{r}
+
+hu_sig_psi <- 
+  hu_sig_psi %>% 
+  tidyr::separate(position, c("chrom", "position"), sep = ":") %>% 
+  tidyr::separate(position, c("start", "end"), sep = "-") %>% 
+  dplyr::mutate(event_id = factor(event_id, levels = event_id))
+
+```
+
+### Convert the wide-format data to a ggplot2-friendly tidy format
+
+I then convert the wide-format dataframe into a long format, where essentially each cell has its own row.  There are many advantages to this 'tidy' format and it's necessary for working with `ggplot2`/`ggiraph`.  I then convert the x-axis column `time` to a factor. `ggplot2` respects the order of factor levels when arranging categorical variables, so this allows me to dictate the column order.  Note that row order will actually be preserved from the re-ordered wide-format dataframe in-spite of the rearrangement.
+
+```{r}
+## Convert to ggplot-friendly long format
+hu_sig_psi_long <- 
+  hu_sig_psi %>%
+  tidyr::gather( 
+    time, 
+    PSI, 
+    -event_id, 
+    -chrom, 
+    -start, 
+    -end) %>% 
+  dplyr::mutate(
+    time = factor(time, levels = c(colnames(hu_sig_psi)[grepl("ESC", colnames(hu_sig_psi))], 
+                                   colnames(hu_sig_psi)[!grepl("ESC", colnames(hu_sig_psi))])))
+```
+
+### Generate field to dictate 'on-click' behavior
+
+Finally I generate the URLs that populated a `window.open()` command that goes in the `onclick` column.  In my case, I am inserting event-specific coordinates to direct the UCSC Genome Browser to specific positions.  I have also done things like programmatically generating PDF summaries of event information that are named 'event###.pdf' which allows me to host those pdfs somewhere and then programmatically generate URLs that point to them for the `window.open()` command.  Many things are possible!
+
+```{r finalized-df, cache=TRUE}
+hu_sig_psi_long$onclick <- 
+  sprintf("window.open(\"%s%s%s%s%s%s%s\")",
+          paste0("http://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&",
+                 "lastVirtModeType=default&lastVirtModeExtraState=&",
+                 "virtModeType=default&virtMode=0&nonVirtPosition=&position="), 
+         hu_sig_psi_long$chrom, 
+         "%3A", 
+         hu_sig_psi_long$start, 
+         "-", 
+         hu_sig_psi_long$end, 
+         "&hgsid=674881929_CwDN81j6joTHN2aGjb2EcEcCbxMP")
+
+
+head(hu_sig_psi_long) %>% 
+  kable("html") %>% 
+  kable_styling() %>% 
+  scroll_box(width = "800px", height = "200px")
+```
+
+## Plot heatmap
+
+Finally we actually create the heatmap!
+
+We start with our x and y features, as well as the aforementioned `geom_tile_interactive` which takes the `toolip` (mouseover text) and `onclick` (URLs in `window.open()` command) aesthetics.  This is the most important bit.
+
+```{r}
+
+hu_sig_psi_heatmap <- 
+  hu_sig_psi_long %>% 
+  ggplot(aes(x = time, y = event_id)) + 
+    geom_tile_interactive(
+      aes(fill = PSI, 
+          tooltip = event_id, 
+          onclick = onclick), 
+          size = 3)
+```
+
+I then add in my preferred color scale (use whatever you like!):
+
+```{r}
+
+  hu_sig_psi_heatmap <- 
+    hu_sig_psi_heatmap + 
+    scale_fill_viridis()
+```
+
+After which I add in the dendrogram using `geom_segment`:
+
+```{r}
+
+hu_sig_psi_heatmap <- 
+    hu_sig_psi_heatmap + 
+    geom_segment(
+      data = data_r, 
+      mapping = aes(x = x_, 
+                    y = y_, 
+                    xend = xend_, 
+                    yend = yend_), 
+      colour = "gray20", size = 0.2)
+```
+
+... and fix the aesthetic issues.  Some of these (`theme_minimal`, `panel.grid.minor`, `panel.grid.major`) are quite helpful in creating something that looks like a typical R heatmap.  
+
+```{r}
+
+hu_sig_psi_heatmap <- 
+    hu_sig_psi_heatmap + 
+    theme_minimal() + 
+    theme(
+      legend.position = "right", 
+      panel.grid.minor = element_line(color = "transparent"), 
+      panel.grid.major = element_line(color = "transparent"), 
+      axis.ticks.length = unit(2, units = "mm"), 
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 12), 
+      axis.title = element_text(size = 9, colour = "gray30"), 
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 5, colour = "gray40"), 
+      legend.title = element_text(face = "bold", hjust = 0.5, size = 8), 
+      legend.text = element_text(size = 6))
+```
+
+Finally, I pass the `ggplot2` object to `ggiraph::girafe`, which creates the html widget.  I then press "knit" in Rstudio to generate the html.
+
+```{r ggiraph-block, cache=TRUE}
+
+x <- girafe(
+  ggobj = hu_sig_psi_heatmap)
+
+
+x <- girafe_options(x, opts_zoom(max = 10))
+
+```
+
+
+```{r}
+x
+```
+
+That's it! I hope this was helpful, and please let me know if you have any questions!
+
+## Session Info
+
+```{r}
+
+sessionInfo()
+
+```

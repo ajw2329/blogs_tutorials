@@ -1,0 +1,6 @@
+*_cache
+*.html
+*.pyc
+*.RData
+*.rdb
+*.rdx
